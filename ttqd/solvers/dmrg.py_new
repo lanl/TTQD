@@ -1,0 +1,633 @@
+from ttqd.solvers.basesolver import BaseSolver
+
+# from ttqd import Backend
+# np = Backend("numpy")
+import numpy as np
+from ttqd.lib import logger
+import scipy.sparse.linalg
+import scipy.sparse as sparse
+import time
+
+# ---------- function for updating environments ----------
+
+
+def update_left(Wi, Ai, Li, Bi):
+    r"""
+    tensor contraction from the left hand side
+    +-(j)   (i)----A---(j)
+    |       |      |
+    |       |     (p)
+    L'(m) = L(k)---M---(m)
+    |       |      |
+    |       |     (q)
+    +-(n)   (l)----B---(n)
+
+    Ai and Bi are bra and ket states, respectively. For most case
+    Bi = conj(Ai), but we here still Bi to make it general that bra state
+    can be anyother state
+
+    .. math::
+
+        L'_{m,j,n} = sum_{kil, pq} Li[kil] Ai[i,p,j] Wi[k,m,p,q] Bi[l,q,n])
+
+    Li: (Dl, wL, Dl)
+    Ai/Bi: (Dl, d, Dr)
+    Wi: (wL, wR, d_out, d_in)
+    returns L(i+1): (Dr, wR, Dr)
+    """
+    # contracting efficiently in a sequence
+    # (vL, wL, vL) * (vL, p, vR), i.e. \sum_j Li_{iaj} * Ai_{jpk} -> {iapk}
+    tmp = np.tensordot(Li, Ai, axes=(2, 0))
+    # sampe as (but more efficient than) out = np.einsum('iaj,jpk.->iapk', Li, Ai)
+
+    # Wi_{km pq} T_{iapk} einsum("abpq, iapk->bqik", Wi, tmp)
+    tmp = np.tensordot(Wi, tmp, axes=([0, 3], [1, 2]))    # [wL] wR i [i*], vL [wL*] [i] vR
+
+    # einsum("iqj, ->", Bi, tmp)
+    return np.tensordot(Bi, tmp, axes=([0, 1], [2, 1]))  # [vL*] [i*] vR*, wR [i] [vL] vR
+
+    tmp = np.einsum("ipj, ikl->pkjl", Ai, Li)  # (w,ljk)
+    tmp = np.einsum("pkjl,kmpq->qmjl", tmp, Wi)  # (t, mjk)
+    return np.einsum("qmjl,lqn->jmn", tmp, Bi)  # (mjl)
+    # return np.einsum("kil, ipj, kmpq, lqn->mjn", Li, Ai, Wi, Bi, optimize=True)
+
+
+def update_right(Wi, Ai, Ri, Bi):
+    """
+    (i)-+     (i)---A----(j)
+        |           |     |
+        |          (p)    |
+    (m)-R' =  (m)---M-(k)-R
+        |           |     |
+        |          (q)    |
+    (n)-+     (n)---B----(l)
+
+    .. math::
+        L'_{min} = \sum_{jkl, pq) B_{nql} W_{mk,pq}  A_{ipj} R_{kjl}
+
+    Ri: (Dr, wR, Dr)
+    Ai/Bi: (Dl, d, Dr)
+    Wi: (wL, wR, d_out, d_in)
+    return R(i): (Dl, wL, Dl)
+    """
+    # contracting efficiently in a sequence (starting at an edge and moving progressively along the network)
+    tmp = np.tensordot(Ai, Ri, axes=(2, 0))  # vL i [vR], [vR*] wR* vR
+    tmp = np.tensordot(tmp, Wi, axes=([1, 2], [3, 1]))  # vL [i] [wR*] vR, wL [wR] i [i*]
+    return np.tensordot(tmp, Bi, axes=([1, 3], [2, 1]))  # vL [vR] wL [i], vL* [i*] [vR*]
+
+    # same as above
+    tmp = np.einsum("ipj,jkl->pkil", Ai, Ri)  # d m_s^3 m_o
+    tmp = np.einsum("pkil,mkpq->qmil", tmp, Wi)  # d^2 m_s^2 m_o^2
+    return np.einsum("qmil,nql->imn", tmp, Bi)  # d m_s^3 m_o
+    # return np.einsum("kjl, ipj, mkpq, nql->min", Ri, Ai, Wi, Bi, optimize=True)
+
+
+## two-site optimization of MPS A,B with respect to MPO W1,W2 and
+## environment tensors L,R
+## dir = 'left' or 'right' for a left-moving or right-moving sweep
+def update_twosites(i, j, psi, mpo, L, R, m, direction):
+    r"""
+    TODO: remove the dependence on a 6-rank tensor
+    """
+    W1, W2 = mpo[i], mpo[j]
+
+    # A, B = psi.As[i], psi.As[j]
+    A, B = psi.get_As(i), psi.get_As(j)
+    W1, W2 = mpo[i], mpo[j]
+
+    W = coarse_grain_MPO(W1, W2)
+    AA = coarse_grain_MPS(A, B)
+
+    # construct effective Hamiltonian
+    # print("L.shape ", L.shape)
+    # print("R.shape ", R.shape)
+    H = HamiltonianMultiply(L, W, R)
+    # print("H.shape i =", H.shape)
+    # print("AA.shape =", AA.shape)
+
+    # update Tensors
+    Ene, V = sparse.linalg.eigsh(H, 1, v0=AA, which="SA")
+
+    AA = np.reshape(V[:, 0], H.req_shape)
+    A, S, B = split_truncate_MPS(AA, [A.shape[1], B.shape[1]])
+    A, S, B, trunc, m = truncate_SVD(A, S, B, m)
+
+    if direction == "right":
+        B = np.einsum("ij,jsk->isk", np.diag(S), B)
+    else:
+        assert direction == "left"
+        A = np.einsum("isj,jk->isk", A, np.diag(S))
+    # Gi = np.tensordot(np.diag(psi.Ss[i]**(-1)), A, axes=(1, 0))  # vL [vL*], [vL] i vC
+    # A = np.tensordot(Gi, np.diag(S), axes=(2, 0))  # vL i [vC], [vC*] vC
+
+    # udpate psi
+    psi.As[i], psi.As[j] = A, B
+    psi.Ss[j] = S
+    return Ene[0] #, trunc, m
+
+
+# 2-1 coarse-graining of two site MPO into one site
+#  |     |  |
+# -R- = -W--X-
+#  |     |  |
+def coarse_grain_MPO(W, X):
+    return np.reshape(
+        np.einsum("abst,bcuv->acsutv", W, X),
+        [W.shape[0], X.shape[1], W.shape[2] * X.shape[2], W.shape[3] * X.shape[3]],
+    )
+
+
+# 2-1 coarse-graining of two-site MPS into one site
+#   |     |  |
+#  -R- = -A--B-
+def coarse_grain_MPS(A, B):
+    return np.reshape(
+        np.einsum("isj,jtk->stik", A, B),
+        [A.shape[1] * B.shape[1], A.shape[0], B.shape[2]],
+    )
+
+
+# opposite of coarse graining, decompose using SVD
+def split_truncate_MPS(A, dims):
+    assert A.shape[0] == dims[0] * dims[1]
+    Theta = np.transpose(np.reshape(A, dims + [A.shape[1], A.shape[2]]), (0, 2, 1, 3))
+    M = np.reshape(Theta, (dims[0] * A.shape[1], dims[1] * A.shape[2]))
+    U, S, V = np.linalg.svd(M, full_matrices=0)
+    # print("U.shape = ", U.shape)
+    # print("dims[0] =", dims[0])
+    U = np.reshape(U, (A.shape[1], dims[0], -1))
+    # print("U.shape after resphae = ", U.shape)
+    # print("V.shape before resphae = ", V.shape)
+    V = np.reshape(V, (-1, dims[1], A.shape[2]))
+    # print("V.shape after resphae = ", V.shape)
+    return U, S, V
+
+
+
+# truncate the matrices from an SVD to at most m states
+def truncate_SVD(U, S, V, m, eps=1.e-10):
+    m = min(len(S), m, np.sum(S > eps))
+    trunc = np.sum(S[m:])
+    S = S[0:m]
+    U = U[:, :, 0:m]
+    V = V[0:m, :, :]
+    return U, S, V, trunc, m
+
+
+def split_truncate_theta(theta, chi_max, eps):
+    """Split and truncate a two-site wave function in mixed canonical form.
+
+    Split a two-site wave function as follows::
+          vL --(theta)-- vR     =>    vL --(A)--diag(S)--(B)-- vR
+                |   |                       |             |
+                i   j                       i             j
+
+    Afterwards, truncate in the new leg (labeled ``vC``).
+
+    Parameters
+    ----------
+    theta : np.Array[ndim=4]
+        Two-site wave function in mixed canonical form, with legs ``vL, i, j, vR``.
+    chi_max : int
+        Maximum number of singular values to keep
+    eps : float
+        Discard any singular values smaller than that.
+
+    Returns
+    -------
+    A : np.Array[ndim=3]
+        Left-canonical matrix on site i, with legs ``vL, i, vC``
+    S : np.Array[ndim=1]
+        Singular/Schmidt values.
+    B : np.Array[ndim=3]
+        Right-canonical matrix on site j, with legs ``vC, j, vR``
+    """
+    chivL, dL, dR, chivR = theta.shape
+    theta = np.reshape(theta, [chivL * dL, dR * chivR])
+    U, S, V = np.linalg.svd(theta, full_matrices=False)
+    # truncate
+    chivC = min(chi_max, np.sum(S > eps))
+    assert chivC >= 1
+    piv = np.argsort(S)[::-1][:chivC]  # keep the largest `chivC` singular values
+    U, S, V = U[:, piv], S[piv], V[piv, :]
+    # renormalize
+    S = S / np.linalg.norm(S)  # == S/sqrt(sum(S**2))
+    # split legs of U and V
+    A = np.reshape(U, [chivL, dL, chivC])
+    B = np.reshape(V, [chivC, dR, chivR])
+    return A, S, B
+
+# Functor to evaluate the Hamiltonian matrix-vector multiply
+#        +--A--+
+#        |  |  |
+# -R- =  L--W--R
+#  |     |  |  |
+#        +-   -+
+class HamiltonianMultiply(sparse.linalg.LinearOperator):
+    def __init__(self, L, W, R):
+        self.L = L
+        self.W = W
+        self.R = R
+        self.dtype = np.dtype("d")
+        self.req_shape = [W.shape[2], L.shape[0], R.shape[2]]
+        self.size = self.req_shape[0] * self.req_shape[1] * self.req_shape[2]
+        self.shape = [self.size, self.size]
+
+    def _matvec(self, A):
+        # contracting efficiently
+        R = np.einsum("iaj,sik->ajsk", self.L, np.reshape(A, self.req_shape))
+        R = np.einsum("ajsk,abst->bjtk", R, self.W)
+        R = np.einsum("bjtk,kbl->tjl", R, self.R)
+        return np.reshape(R, -1)
+
+
+class Heff_0site(scipy.sparse.linalg.LinearOperator):
+    """Class for the effective Hamiltonian.
+
+    Basically the same as d_dmrg.Heff_1site, but acts on the zero-site wave function::
+
+        .--vL*   vR*--.
+        |             |
+        |             |
+       (LP)----------(RP)
+        |             |
+        |             |
+        .--vL     vR--.
+    """
+    def __init__(self, LP, RP, prefactor=1.):
+        self.LP = LP  # vL wL* vL*
+        self.RP = RP  # vR* wR* vR
+        chi1, chi2 = LP.shape[0], RP.shape[2]
+        self.theta_shape = (chi1, chi2)  # vL vR
+        self.shape = (chi1 * chi2, chi1 * chi2)
+        self.dtype = LP.dtype
+
+    def _matvec(self, theta):
+        """Calculate |theta'> = H_eff |theta>."""
+        x = np.reshape(theta, self.theta_shape)  # vL vR
+        x = np.tensordot(self.LP, x, axes=(2, 0))  # vL wL* [vL*], [vL] vR
+        x = np.tensordot(x, self.RP, axes=([1, 2], [1, 0]))  # vL [wL*] [vL*] , [vR*] [wR*] vR
+        x = np.reshape(x, self.shape[0])
+        return x
+
+    def _adjoint(self):
+        """Define self as hermitian."""
+        return self
+
+    def trace(self):
+        """The trace of the operator.
+
+        Only needed for expm_multiply in scipy version > 1.9.0 to avoid warnings,
+        but cheap to calculate anyways.
+        """
+        return np.inner(np.trace(self.LP, axis1=0, axis2=2),  # [vL] wL* [vL*]
+                        np.trace(self.RP, axis1=0, axis2=2))  # [vR*] wR* [vR]
+
+
+class Heff_1site(scipy.sparse.linalg.LinearOperator):
+    """Class for the effective Hamiltonian on 1 site.
+
+    Basically the same as dmrg.Heff2, but acts on a single site::
+
+        .--vL*     vR*--.
+        |       i*      |
+        |       |       |
+       (LP)----(W1)----(RP)
+        |       |       |
+        |       i       |
+        .--vL       vR--.
+    """
+    def __init__(self, LP, RP, W1, prefactor=1.):
+        self.LP = LP  # vL wL* vL*
+        self.RP = RP  # vR* wR* vR
+        self.W1 = W1  # wL wR i i*
+        chi1, chi2 = LP.shape[0], RP.shape[2]
+        d1 = W1.shape[2]
+        self.theta_shape = (chi1, d1, chi2)  # vL i vR
+        self.shape = (chi1 * d1 * chi2, chi1 * d1 * chi2)
+        self.dtype = W1.dtype
+
+    def _matvec(self, theta):
+        """Calculate |theta'> = H_eff |theta>."""
+        x = np.reshape(theta, self.theta_shape)  # vL i vR
+        x = np.tensordot(self.LP, x, axes=(2, 0))  # vL wL* [vL*], [vL] i vR
+        x = np.tensordot(x, self.W1, axes=([1, 2], [0, 3]))  # vL [wL*] [i] vR, [wL] wR i [i*]
+        x = np.tensordot(x, self.RP, axes=([1, 2], [0, 1]))  # vL [vR] [wR] i, [vR*] [wR*] vR
+        x = np.reshape(x, self.shape[0])
+        return x
+
+    def _adjoint(self):
+        """Define self as hermitian."""
+        return self
+
+    def trace(self):
+        """The trace of the operator.
+
+        Only needed for expm_multiply in scipy version > 1.9.0 to avoid warnings,
+        but cheap to calculate anyways.
+        """
+        return np.inner(np.trace(self.LP, axis1=0, axis2=2),          # [vL] wL* [vL*]
+                        np.dot(np.trace(self.W1, axis1=2, axis2=3),   # wL wR [i] [i*]
+                               np.trace(self.RP, axis1=0, axis2=2)))  # [vR*] wR* [vR]
+
+
+class Heff_2site(sparse.linalg.LinearOperator):
+    r"""Makeing effective Hamiltonain class without
+    explicitly constructing 6-index tensor
+    """
+    def __init__(self, Li, Rj, Wi, Wj):
+        self.Li = Li
+        self.Rj = Rj
+        self.Wi = Wi
+        self.Wj = Wj
+
+        chii, chij = Li.shape[0], Rj.shape[2]
+        di, dj = Wi.shape[2], Wj.shape[2]
+        self.theta_shape = (chii, di, dj, chij)  # vL i j vR
+        self.shape = (chii * di * dj * chij, chii * di * dj * chij)
+        self.dtype = Wi.dtype
+
+    def _matvec(self, x):
+        y = np.reshape(x, self.theta_shape)  # vL i j vR
+        y = np.tensordot(self.Li, y, axes=(2, 0))  # vL wL* [vL*], [vL] i j vR
+        y = np.tensordot(y, self.Wi, axes=([1, 2], [0, 3]))  # vL [wL*] [i] j vR, [wL] wC i [i*]
+        y = np.tensordot(y, self.Wj, axes=([3, 1], [0, 3]))  # vL [j] vR [wC] i, [wC] wR j [j*]
+        y = np.tensordot(y, self.Rj, axes=([1, 3], [0, 1]))  # vL [vR] i [wR] j, [vR*] [wR*] vR
+        y = np.reshape(y, self.shape[0])
+        return y
+
+
+    def _adjoint(self):
+        """Define self as hermitian."""
+        return self
+
+    def trace(self):
+        """The trace of the operator.
+
+        Only needed in e_tdvp.py in expm_multiply for scipy version > 1.9.0 to avoid warnings,
+        but cheap to calculate anyways.
+        """
+        return np.inner(np.trace(self.Li, axis1=0, axis2=2),                  # [vL] wL* [vL*]
+                        np.dot(np.trace(self.Wi, axis1=2, axis2=3),           # wL wC [i] [i*]
+                               np.dot(np.trace(self.Wj, axis1=2, axis2=3),    # wC wR [j] [j*]
+                                      np.trace(self.Rj, axis1=0, axis2=2))))  # [vR*] wR* [vR]
+
+
+# ==========================
+# DMRG class
+# ==========================
+class DMRG(BaseSolver):
+    r"""
+    DMRG sweep algorithm using tree traversal order
+
+    This implementation no longer assumes that the MPS is represented as a
+    bare Python list of arrays.  Instead the solver works with the
+    :class:`~ttqd.network.MPS` container and relies on its built-in tree
+    structure.  Sweeps traverse the network using ``_downward_order`` and
+    ``_upward_order`` which for a linear chain reduce to the familiar left‑to‑
+    right and right‑to‑left passes.  Environment tensors are recomputed after
+    each local update via the helper methods provided by ``MPS``.
+    """
+
+    # may add sys as an input
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.L = None
+        self.R = None
+        self.maxiter = kwargs.get("maxiter", 50)
+        self.maxchi = kwargs.get("maxchi", 50)
+        self.adapativebond = kwargs.get("adapativebond", False)
+        # other options TBA
+        self.chi = 1
+        self.boundary = kwargs.get("boundary", "finite")
+        self.threshold = kwargs.get("threshold", 1.e-10)
+
+    def dump_flags(self):
+        title = logger.task_title("DMRG flags", level=0)
+        logger.note(self, title)
+        logger.note(self, f"Convergence tol =  {self.tol:10.4e}")
+        logger.note(self, f"Max iteration   =  {self.maxiter: 5d}")
+
+    def check_convergence(self):
+        pass
+
+    def diag(self, Heff, guess):
+        guess = np.reshape(guess, [Heff.shape[1]])
+        E, V = sparse.linalg.eigsh(Heff, k=1, which='SA', return_eigenvectors=True, v0=guess)
+        return E, np.reshape(V[:, 0], Heff.theta_shape)
+
+    def compute_envs(self):
+        r"""Recompute left/right MPO environments from scratch.
+
+        The environments are 3‑index arrays ``(v, w, v)`` containing the
+        contraction of the MPS and MPO up to a given bond.  This mimics the
+        historic behaviour of :func:`update_left`/``update_right`` and is
+        required by ``Heff_2site`` which expects the MPO leg to remain open.
+        """
+        N = self.Nsites
+        chi = self.chi
+        wD = self.wD
+
+        Lenv = [np.zeros((chi, wD, chi)) for _ in range(N)]
+        Renv = [np.zeros((chi, wD, chi)) for _ in range(N)]
+
+        # boundary conditions
+        Lenv[0][:, 0, :] = np.eye(chi)
+        Renv[-1][:, wD - 1, :] = np.eye(chi)
+
+        # propagate left-to-right
+        for i in range(N - 1):
+            Lenv[i + 1] = update_left(
+                self.mpo[i], self.psi.As[i], Lenv[i], self.psi.As[i].conj()
+            )
+
+        # propagate right-to-left
+        for i in range(N - 1, 0, -1):
+            Renv[i - 1] = update_right(
+                self.mpo[i], self.psi.As[i], Renv[i], self.psi.As[i].conj()
+            )
+
+        self.Lenv, self.Renv = Lenv, Renv
+
+    def init_envs(self, mpo, psi):
+        r"""Initialize solver with MPO/MPS and set up environments."""
+        self.Nsites = len(mpo)
+        assert self.Nsites == psi.L
+        self.mpo = mpo
+        self.psi = psi
+        self.chi = psi.As[0].shape[0]
+        self.wD = mpo[0].shape[0]
+        # compute environment tensors
+        self.compute_envs()
+        if self.boundary == "finite":
+            self.num_bonds = self.Nsites - 1
+        else:
+            self.num_bonds = self.Nsites
+
+    def update_right(self, i, B):
+        """Legacy stub: environments are recomputed automatically.
+
+        The old implementation updated a single bond environment when the
+        neighboring tensor ``B`` changed.  In the refactored code we simply
+        recompute the full left/right environments after each two‑site update
+        (see :meth:`update_local`), so this method no longer needs to do any
+        work.  It is retained for backwards compatibility but does nothing.
+        """
+        # recompute both environments – this is cheap compared to diagonalizing
+        # the effective Hamiltonian and keeps callers from worrying about the
+        # order in which sites were optimized.
+        self.Lenv = self.psi.left_envs()
+        self.Renv = self.psi.right_envs()
+
+
+    def update_left(self, i, A):
+        """Legacy stub: full environment recomputation.
+
+        See :meth:`update_right` for rationale.  In practice callers should no
+        longer use this method.
+        """
+        self.Lenv = self.psi.left_envs()
+        self.Renv = self.psi.right_envs()
+
+
+    def update_local(self, site_a, site_b):
+        r"""Optimize a two-site tensor on the bond connecting ``site_a`` and
+        ``site_b``.
+
+        The routine is written in an orientation-agnostic way: the two sites are
+        sorted internally so that ``left`` is the smaller index and ``right`` is
+        its neighbor.  This allows us to call the same method during both the
+        downward and upward parts of a sweep without worrying about the
+        ordering of the traversal list.
+        """
+        # determine left/right orientation and check adjacency
+        if site_b == (site_a + 1) % self.Nsites:
+            left, right = site_a, site_b
+        elif site_a == (site_b + 1) % self.Nsites:
+            left, right = site_b, site_a
+        else:
+            raise ValueError(f"Sites {site_a} and {site_b} are not adjacent")
+
+        # effective Hamiltonian uses left environment on bond left of ``left``
+        # and right environment on bond right of ``right``
+        Heff = Heff_2site(self.Lenv[left], self.Renv[right],
+                          self.mpo[left], self.mpo[right])
+
+        # two-site wavefunction (always in order left,right)
+        v0 = self.psi.get_psi_2site(left)
+        v0 = np.reshape(v0, [Heff.shape[1]])
+        E, V = sparse.linalg.eigsh(Heff, k=1, which='SA', return_eigenvectors=True, v0=v0)
+        V = np.reshape(V[:, 0], Heff.theta_shape)
+
+        # split and truncate to maximum bond dimension
+        Ai, Sj, Bj = split_truncate_theta(V, self.maxchi, 1.e-8)
+
+        # apply gauge transform using the previous Schmidt values on the left
+        Gi = np.tensordot(np.diag(self.psi.Ss[left] ** (-1)), Ai, axes=(1, 0))
+        self.psi.As[left] = np.tensordot(Gi, np.diag(Sj), axes=(2, 0))
+        self.psi.Ss[right] = Sj
+        self.psi.As[right] = Bj
+
+        # recompute the full MPO environments after modifying the MPS
+        # (still cheap relative to the eigensolver).
+        self.compute_envs()
+
+        return E[0]
+
+
+    def sweep(self, mpo, psi):
+        """Perform one full DMRG sweep using the MPS traversal orders.
+
+        We iterate over bonds in two passes: the downward (root-to-leaves)
+        order given by ``psi._downward_order`` and then the reverse order from
+        ``psi._upward_order``.  ``update_local`` takes care of orienting the
+        two-site update correctly, so the sweep logic becomes very simple.
+        """
+        energy = None
+        # ensure MPO environments match current MPS tensors
+        self.compute_envs()
+
+        down = psi._downward_order()
+        for idx in range(len(down) - 1):
+            energy = self.update_local(down[idx], down[idx + 1])
+
+        up = psi._upward_order()
+        for idx in range(len(up) - 1):
+            energy = self.update_local(up[idx], up[idx + 1])
+
+        return energy
+
+    def kernel(self, mpo, psi, maxiter=100, tol=1.0e-8):
+        t0 = time.time()
+        self.maxiter = maxiter
+        self.dump_flags()
+        if tol < self.tol:
+            self.tol = tol
+        self.psi = psi
+        self.mpo = mpo
+        self.verbose = psi.verbose
+
+        # 1) initialize environments
+        self.init_envs(mpo, psi)
+
+        energy = 0.0
+        oldenergy = 0.0
+        error = 0.0
+        logger.note(self, f"Sweep {' ' * 14} Energy {' ' * 12} Error")
+        for isweep in range(maxiter):
+            energy = self.sweep(mpo, psi)
+
+            error = abs(energy - oldenergy)
+            logger.note(self, f"Sweep {isweep: 5d} {energy:18.12f} {error:18.12f}")
+            if error < self.tol:
+                logger.note(self, "DMRG sweep converged!")
+                break
+            else:
+                oldenergy = energy
+        self.energy = energy
+
+        self.wt_kernel += time.time() - t0
+        self.post_kernel()
+
+    def post_kernel(self):
+        final_chi = [A.shape[2] for A in self.psi.As]  # .As]
+        header = logger.task_title(f"Summary of {self.__class__.__name__} calculation")
+        logger.note(self, header)
+        logger.note(self, f" Final bond dimension {final_chi}")
+        logger.note(self, f" Total wall time of DMRG kernel              : {self.wt_kernel:12.4f}")
+        logger.note(self, f" Total wall time of sweep algorithm          : {self.wt_sweep:12.4f}")
+        logger.note(self, f" Total wall time of constructing effective H : {self.wt_Heff:12.4f}")
+        logger.note(self, f" Total wall time of constructing environments: {self.wt_envs:12.4f}")
+        logger.note(self, f" Total wall time of diagonalizating H        : {self.wt_diag:12.4f}")
+        logger.note(self, f" Total wall time of updating bonds           : {self.wt_bond:12.4f}")
+        logger.note(self, f"\n * Hooray, the job is done!")
+        fotter = logger.task_title("The end").split("\n")[1] + "\n"
+        logger.note(self, fotter)
+
+
+# may define 1-site, and 2site DMRG into different class
+
+
+if __name__ == "__main__":
+    d = 4  # local bond dimension, |0>, |up>, |dn>, |up,dn>
+    N = 6  # number of sites
+    t = -1  # hopping element
+    U = 2  # on-site repulsion
+    chi = 10  #
+
+    # initialize MPS with bond dimension = 1
+    InitialA1 = np.zeros((d, 1, 1))
+    InitialA1[1, 0, 0] = 1
+    InitialA2 = np.zeros((d, 1, 1))
+    InitialA2[2, 0, 0] = 1
+
+    MPS = [InitialA1, InitialA2] * int(N / 2)
+    # print("initial state =", len(MPS))
+    # for i in range(N):
+    #    print(f"MPS at site {i}: ", MPS[i])
+
+    # local operator and MPO
+
+    MPO = None
+    dmrg = DMRG()
+    dmrg.kernel(MPO, MPS, maxiter=50)

@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# C extensions
+*.so
+*.dylib
+*_bak*
+*.o
+*.a
+*.out
+
+# other extensions
+tmp*
+out.*
+curr*
+*xx
+*.bin
+*.ch
+*.out
+*.dat
+*.cfg
+*.h5
+*.pdf
+*log*
+*.txt
+!CMakeLists.txt
+!**/CMakeLists.txt
+*.bak
+*.tmp
+*.png
+*.i
+.DS_Store
+*.sh
+*.npz
+*.csv
+
+# sample file
+*sample*py
+
+# output files
+*.chk
+*build/
